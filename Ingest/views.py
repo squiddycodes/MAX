@@ -15,6 +15,10 @@ def fetchCases(request):
     return
 
 def Ingest(request):
+    #CREATE STOCKS
+    for stock in ["AAPL", "MSFT", "TXN", "NVDA"]:
+        models.Stock(ticker=stock).save()
+
     #get the absolute path of the json files
     base_dir = Path(__file__).resolve().parent 
     parent_dir = base_dir.parent
@@ -24,6 +28,7 @@ def Ingest(request):
         with file.open('r') as f:
             data = json.load(f)#load json
             for obj in data:
+                stockTicker = models.Stock.objects.filter(ticker=obj["ticker"])
                 case = models.Case(
                     ticker=obj["ticker"],
                     t=obj["t"],
@@ -37,6 +42,7 @@ def Ingest(request):
                     vw=obj["vw"],
                     n=obj["n"],
                     span=obj["span"],
+                    stock=stockTicker[0]
                     #vola=
                 )
                 case.save()
