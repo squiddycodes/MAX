@@ -7,7 +7,39 @@ matplotlib.use('Agg')  # Use non-GUI backend for server environments
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import base64
+import io
 from io import BytesIO
+import math
+from typing import Dict
+import numpy as np
+import pandas as pd
+from django.http import JsonResponse, HttpRequest
+from django.views.decorators.http import require_GET
+import cvxpy as cp
+import base64
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import cvxpy as cp
+from django.shortcuts import render
+from django.http import HttpRequest, JsonResponse
+from django.views.decorators.http import require_GET
+from .models import Case, Prediction, PredictionMeta, Stock
+from django.shortcuts import render
+from django.http import HttpRequest, JsonResponse
+# views.py
+import math
+from typing import Dict, List
+import numpy as np
+import pandas as pd
+from django.shortcuts import render
+from django.http import JsonResponse, HttpRequest
+from django.views.decorators.http import require_GET
+
+from .models import Case, Stock
+
 
 import numpy as np
 import pandas as pd
@@ -567,3 +599,660 @@ def GenerateLSTMPredictions(request):
         "generated_at": datetime.now().isoformat(),
         "results": results,
     })
+
+
+from .models import Case, Stock
+
+# ---- Defaults ----
+DEFAULT_WINDOW = 60
+DEFAULT_RF_ANNUAL = 0.0386  # 3-mo T-bill coupon-equiv, as of 2025-10-24
+
+def _periods_per_year(span: str) -> float:
+    span = (span or "").lower().strip()
+    days_per_year = 252.0
+    if span in ("1d", "day", "1day", "d"):
+        return days_per_year
+    if span in ("30min", "30m", "30"):
+        return 13.0 * days_per_year         # 6.5h/day / 0.5h
+    if span in ("15min", "15m"):
+        return 26.0 * days_per_year
+    if span in ("60min", "1h", "60m"):
+        return 6.5 * days_per_year
+    if span in ("5min", "5m"):
+        return 78.0 * days_per_year
+    try:
+        if "min" in span:
+            mins = float(span.replace("min", "").replace("m", ""))
+            per_day = 390.0 / mins          # 390 trading minutes/day
+            return per_day * days_per_year
+    except Exception:
+        pass
+    return days_per_year
+
+# =========================
+# A) Metrics (already added before; unchanged except RF hard-coded)
+# =========================
+DEFAULT_WINDOW = 60
+RF_ANNUAL = 0.0386  # hard-coded 3-mo T-bill coupon-equivalent
+
+def _periods_per_year(span: str) -> float:
+    span = (span or "").lower().strip()
+    days_per_year = 252.0
+    if span in ("1d", "day", "1day", "d"):
+        return days_per_year
+    if span in ("30min", "30m", "30"):
+        return 13.0 * days_per_year         # 6.5h/day / 0.5h
+    if span in ("15min", "15m"):
+        return 26.0 * days_per_year
+    if span in ("60min", "1h", "60m"):
+        return 6.5 * days_per_year
+    if span in ("5min", "5m"):
+        return 78.0 * days_per_year
+    try:
+        if "min" in span:
+            mins = float(span.replace("min", "").replace("m", ""))
+            per_day = 390.0 / mins
+            return per_day * days_per_year
+    except Exception:
+        pass
+    return days_per_year
+
+def _compute_roll_metrics(df: pd.DataFrame, window: int, ppy: float, rf_annual: float) -> pd.DataFrame:
+    df = df.sort_values("iso_ny").reset_index(drop=True)
+    px = df["c"].astype(float)
+    r = np.log(px / px.shift(1))
+    df["ret"] = r
+    roll_std  = r.rolling(window=window, min_periods=window).std(ddof=1)
+    roll_mean = r.rolling(window=window, min_periods=window).mean()
+    vola_ann   = roll_std * math.sqrt(ppy)
+    excess_ann = (roll_mean * ppy) - rf_annual
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sharpe_ann = excess_ann / vola_ann
+    df["vola"]   = vola_ann.replace([np.inf, -np.inf], np.nan)
+    df["sharpe"] = sharpe_ann.replace([np.inf, -np.inf], np.nan)
+    return df
+
+
+# =========================
+# B) Allocation + Dollar-neutral Hedge (NEW)
+# =========================
+# Requires cvxpy in your env
+
+DEFAULT_LOOKBACK_DAYS = 252    # anchor in trading days
+DEFAULT_SPAN = "30min"
+
+def _fetch_returns(tickers: List[str], span: str, lookback_days: int) -> pd.DataFrame:
+    """Returns aligned per-period log-returns DataFrame (rows=time, cols=tickers)."""
+    rets = []
+    for t in tickers:
+        qs = (Case.objects
+              .filter(ticker=t, span=span)
+              .order_by("iso_ny")
+              .values("iso_ny", "c"))
+        rows = list(qs)
+        if len(rows) < 3:
+            continue
+        df = pd.DataFrame(rows)
+        df["iso_ny"] = pd.to_datetime(df["iso_ny"])
+        df = df.dropna(subset=["c"]).set_index("iso_ny").sort_index()
+        ppy = _periods_per_year(span)
+        periods = int(max(50, round(lookback_days * (ppy / 252.0))))
+        df = df.iloc[-periods:]
+        r = np.log(df["c"].astype(float) / df["c"].astype(float).shift(1)).dropna()
+        r.name = t
+        rets.append(r)
+    if not rets:
+        raise RuntimeError("Insufficient data to build returns matrix.")
+    R = pd.concat(rets, axis=1, join="inner").dropna(how="any")
+    return R
+
+def _annualize_mu_sigma(R: pd.DataFrame, span: str):
+    """Annualized mu and Sigma from per-period log-returns."""
+    ppy = _periods_per_year(span)
+    mu_per = R.mean(axis=0).values
+    cov_per = np.cov(R.values.T, ddof=1)
+    mu_ann = mu_per * ppy
+    Sigma_ann = cov_per * ppy
+    return mu_ann, Sigma_ann, ppy
+
+
+
+
+def _portfolio_stats(w: np.ndarray, mu_ann: np.ndarray, Sigma_ann: np.ndarray, rf: float):
+    mu_p = float(w @ mu_ann)
+    var_p = float(w @ Sigma_ann @ w)
+    sig_p = math.sqrt(max(0.0, var_p))
+    sharpe = (mu_p - rf) / sig_p if sig_p > 0 else float("nan")
+    return mu_p, sig_p, sharpe
+
+# =========================
+# C) The function-based view (both buttons)
+# =========================
+# @require_GET
+# def PortfolioOptimizer(request: HttpRequest):
+#     """
+#     - Default: render 'portfolio.html'.
+#     - ?run=1           -> compute & store rolling annualized volatility and Sharpe into Case.vola / Case.risk
+#     - ?optimize=1      -> solve allocation and dollar-neutral hedge; returns JSON unless you omit &format=json
+#       Params (optimize):
+#         span=30min|1d        (default 30min)
+#         tickers=NVDA,MSFT,... (default: all Stock.ticker present)
+#         lookback_days=252     (trading-day anchor for history length)
+#         mv_long_only=1|0      (default 1)
+#         sims=4000             (GBM scenarios)
+#         horizon_periods=252   (simulation horizon in periods of given span)
+#         cvar_alpha=0.95
+#         l1_hedge=0.5          (||h||_1 cap)
+#         format=json           (return JSON)
+#     """
+#     # ---- Button A: compute volatility & Sharpe into DB ----
+#     if request.GET.get("run"):
+#         window = int(request.GET.get("window", DEFAULT_WINDOW))
+#         result = _run_optimizer_metrics(
+#             window=window,
+#             rf_annual=RF_ANNUAL,
+#             tickers_param=request.GET.get("tickers"),
+#             spans_param=request.GET.get("spans"),
+#         )
+#         if request.GET.get("format") == "json":
+#             return JsonResponse({"status": "ok", **result})
+#         return render(request, "portfolio.html", {"optimizer_result": result})
+
+#     # ---- Button B: optimize portfolio + dollar-neutral hedge overlay ----
+#     if request.GET.get("optimize"):
+#         # read params
+#         span = request.GET.get("span", DEFAULT_SPAN)
+#         lookback_days = int(request.GET.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
+#         mv_long_only = request.GET.get("mv_long_only", "1") == "1"
+#         sims = int(request.GET.get("sims", 4000))
+#         horizon_periods = int(request.GET.get("horizon_periods", 252))
+#         cvar_alpha = float(request.GET.get("cvar_alpha", 0.95))
+#         l1_hedge = float(request.GET.get("l1_hedge", 0.5))
+
+#         if request.GET.get("tickers"):
+#             tickers = [t.strip().upper() for t in request.GET.get("tickers").split(",") if t.strip()]
+#         else:
+#             tickers = list(Stock.objects.values_list("ticker", flat=True).distinct())
+
+#         # build returns, annualize
+#         R = _fetch_returns(tickers, span, lookback_days)
+#         mu_ann, Sigma_ann, ppy = _annualize_mu_sigma(R, span)
+
+#         # QP: mean-variance base portfolio (sum=1)
+#         w_mv = _solve_mean_variance(mu_ann, Sigma_ann, rf=RF_ANNUAL, long_only=mv_long_only)
+
+#         # GBM scenarios -> CVaR LP hedge (sum=0)
+#         S = _simulate_gbm(mu_ann, Sigma_ann, ppy, horizon_periods=horizon_periods, sims=sims)
+#         h = _solve_cvar_dollar_neutral(S, alpha=cvar_alpha, l1_hedge=l1_hedge)
+
+#         # combine: total weights still sum to 1
+#         w_total = w_mv + h
+
+#         # stats
+#         mv_stats = _portfolio_stats(w_mv, mu_ann, Sigma_ann, rf=RF_ANNUAL)
+#         total_stats = _portfolio_stats(w_total, mu_ann, Sigma_ann, rf=RF_ANNUAL)
+
+#         payload = {
+#             "status": "ok",
+#             "rf_annual": RF_ANNUAL,
+#             "span": span,
+#             "tickers": tickers,
+#             "lookback_days": lookback_days,
+#             "ppy": _periods_per_year(span),
+#             "mv_long_only": mv_long_only,
+#             "sims": sims,
+#             "horizon_periods": horizon_periods,
+#             "cvar_alpha": cvar_alpha,
+#             "l1_hedge": l1_hedge,
+#             "weights_mv": {t: float(w) for t, w in zip(tickers, w_mv)},
+#             "weights_hedge_dollar_neutral": {t: float(x) for t, x in zip(tickers, h)},
+#             "weights_total": {t: float(w) for t, w in zip(tickers, w_total)},
+#             "mv_stats": {"mu_ann": mv_stats[0], "sigma_ann": mv_stats[1], "sharpe": mv_stats[2]},
+#             "total_stats": {"mu_ann": total_stats[0], "sigma_ann": total_stats[1], "sharpe": total_stats[2]},
+#             "checks": {
+#                 "sum_mv": float(np.sum(w_mv)),
+#                 "sum_hedge": float(np.sum(h)),  # should be ~0
+#                 "sum_total": float(np.sum(w_total))  # should be ~1
+#             }
+#         }
+
+#         if request.GET.get("format") == "json":
+#             return JsonResponse(payload)
+#         return render(request, "portfolio.html", {"optimize_result": payload})
+
+#     # default render
+#     return render(request, "portfolio.html")
+
+def _compute_roll_metrics(df: pd.DataFrame, window: int, ppy: float, rf_annual: float) -> pd.DataFrame:
+    df = df.sort_values("iso_ny").reset_index(drop=True)
+    px = df["c"].astype(float)
+    r = np.log(px / px.shift(1))
+    df["ret"] = r
+
+    roll_std  = r.rolling(window=window, min_periods=window).std(ddof=1)
+    roll_mean = r.rolling(window=window, min_periods=window).mean()
+
+    vola_ann   = roll_std * math.sqrt(ppy)
+    excess_ann = (roll_mean * ppy) - rf_annual
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sharpe_ann = excess_ann / vola_ann
+
+    df["vola"]   = vola_ann.replace([np.inf, -np.inf], np.nan)
+    df["sharpe"] = sharpe_ann.replace([np.inf, -np.inf], np.nan)
+    return df
+
+def _run_optimizer(window: int, rf_annual: float, tickers_param: str | None, spans_param: str | None):
+    # Decide which tickers to run
+    if tickers_param:
+        tickers = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
+    else:
+        tickers = list(Stock.objects.values_list("ticker", flat=True).distinct())
+
+    updated_rows_total = 0
+    per_group_counts: Dict[str, int] = {}
+
+    for ticker in tickers:
+        span_qs = Case.objects.filter(ticker=ticker).values_list("span", flat=True).distinct()
+        spans = [s for s in span_qs if s]
+        if spans_param:
+            spans_req = [s.strip() for s in spans_param.split(",") if s.strip()]
+            spans = [s for s in spans if s in spans_req]
+        if not spans:
+            continue
+
+        for span in spans:
+            qs = (Case.objects
+                  .filter(ticker=ticker, span=span)
+                  .order_by("iso_ny")
+                  .values("id", "iso_ny", "c"))
+            rows = list(qs)
+            if len(rows) < window + 1:
+                per_group_counts[f"{ticker}:{span}"] = 0
+                continue
+
+            df = pd.DataFrame(rows)
+            if not pd.api.types.is_datetime64_any_dtype(df["iso_ny"]):
+                df["iso_ny"] = pd.to_datetime(df["iso_ny"])
+
+            ppy = _periods_per_year(span)
+            dfm = _compute_roll_metrics(df[["id", "iso_ny", "c"]].copy(), window, ppy, rf_annual)
+
+            ids = dfm["id"].tolist()
+            vola_vals = dfm["vola"].tolist()
+            sharpe_vals = dfm["sharpe"].tolist()
+
+            case_map = {c.id: c for c in Case.objects.filter(id__in=ids)}
+            updates = []
+            for _id, v, s in zip(ids, vola_vals, sharpe_vals):
+                obj = case_map.get(_id)
+                if obj is None:
+                    continue
+                obj.vola = float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else None
+                obj.risk = float(s) if s is not None and not (isinstance(s, float) and math.isnan(s)) else None
+                updates.append(obj)
+
+            if updates:
+                Case.objects.bulk_update(updates, ["vola", "risk"], batch_size=1000)
+                per_group_counts[f"{ticker}:{span}"] = len(updates)
+                updated_rows_total += len(updates)
+            else:
+                per_group_counts[f"{ticker}:{span}"] = 0
+
+    return {
+        "window": window,
+        "rf_annual": rf_annual,
+        "updated_total": updated_rows_total,
+        "per_group": per_group_counts
+    }
+# =========================
+# Model-driven portfolio optimizer (QCQP) with HTML render
+# =========================
+
+# ----- Tunables -----
+RF_ANNUAL = 0.0386                         # risk-free (annualized)
+W_MAX     = 0.50                           # per-name cap
+LAMBDA    = 2.5                            # return-risk tradeoff in objective
+GAMMA_MODEL_BLEND = 0.60                   # weight of model forecasts in expected return
+BETA_COV_INFLATE  = 0.25                   # how much model risk inflates covariance
+KAPPA_UNCERT      = 0.18                   # SOC cap for forecast-uncertainty exposure
+LOOKBACK_DAYS     = 252                    # history anchor
+DEFAULT_SPAN      = "30min"
+
+# alpha weights for risk score
+ALPHA_RMSE, ALPHA_MAPE, ALPHA_ME = 0.5, 0.3, 0.2
+
+# -------------- utilities --------------
+
+def _periods_per_year(span: str) -> float:
+    span = (span or "").lower().strip()
+    days_per_year = 252.0
+    if span in ("1d", "day", "1day", "d"):
+        return days_per_year
+    if span in ("30min", "30m", "30"):
+        return 13.0 * days_per_year
+    if span in ("60min", "1h", "60m"):
+        return 6.5 * days_per_year
+    if span in ("15min", "15m"):
+        return 26.0 * days_per_year
+    if span in ("5min", "5m"):
+        return 78.0 * days_per_year
+    try:
+        if "min" in span:
+            mins = float(span.replace("min", "").replace("m", ""))
+            per_day = 390.0 / mins
+            return per_day * days_per_year
+    except Exception:
+        pass
+    return days_per_year
+
+def _fetch_returns(tickers, span, lookback_days=LOOKBACK_DAYS) -> pd.DataFrame:
+    """Aligned per-period log returns for tickers/span."""
+    series = []
+    for t in tickers:
+        qs = (Case.objects
+              .filter(ticker=t, span=span)
+              .order_by("iso_ny")
+              .values("iso_ny", "c"))
+        rows = list(qs)
+        if len(rows) < 3:
+            continue
+        df = pd.DataFrame(rows)
+        df["iso_ny"] = pd.to_datetime(df["iso_ny"])
+        df = df.dropna(subset=["c"]).set_index("iso_ny").sort_index()
+
+        ppy = _periods_per_year(span)
+        periods = int(max(50, round(lookback_days * (ppy / 252.0))))
+        df = df.iloc[-periods:]
+        r = np.log(df["c"].astype(float) / df["c"].astype(float).shift(1)).dropna()
+        r.name = t
+        series.append(r)
+    if not series:
+        raise RuntimeError("Insufficient price history for returns.")
+    R = pd.concat(series, axis=1, join="inner").dropna(how="any")
+    return R
+
+def _annualize_mu_sigma(R: pd.DataFrame, span: str):
+    ppy = _periods_per_year(span)
+    mu_per = R.mean(axis=0).values            # (n,)
+    cov_per = np.cov(R.values.T, ddof=1)      # (n,n)
+    mu_ann = mu_per * ppy
+    Sigma_ann = cov_per * ppy
+    return mu_ann, Sigma_ann, ppy
+
+def _metrics_from_predictions(ticker: str) -> dict:
+    """
+    Compute RMSE, MAPE, ME per model for this ticker using Prediction table.
+    Returns:
+      {
+        model_name: {"rmse":..., "mape":..., "me":..., "mu_model_ann": ...}
+      }
+    """
+    rows = list(Prediction.objects.filter(ticker=ticker).values(
+        "model", "pred_close", "actual_close", "iso_time"
+    ))
+    if not rows:
+        return {}
+
+    df = pd.DataFrame(rows)
+    df = df.dropna(subset=["pred_close", "actual_close"])
+    out = {}
+    for model, g in df.groupby("model"):
+        yhat = g["pred_close"].astype(float).values
+        y    = g["actual_close"].astype(float).values
+        if len(y) < 5 or np.all(y == 0):
+            continue
+
+        rmse = float(np.sqrt(np.mean((yhat - y) ** 2)))
+        mape = float(np.mean(np.abs((yhat - y) / np.clip(y, 1e-12, None))) * 100.0)
+        me   = float(np.mean(yhat - y))
+
+        # crude model-implied simple return (periodized from consecutive preds vs actuals)
+        # If you store horizon>1, this still yields an average per-step drift proxy.
+        rets = (yhat[1:] / np.where(yhat[:-1] == 0, yhat[:-1] + 1e-12, yhat[:-1])) - 1.0
+        mu_model_per = float(np.nanmean(rets)) if len(rets) > 0 else 0.0
+
+        # annualize assuming 30-min by default; we’ll rescale later if needed
+        ppy = _periods_per_year(DEFAULT_SPAN)
+        mu_model_ann = mu_model_per * ppy
+
+        out[model] = {"rmse": rmse, "mape": mape, "me": me, "mu_model_ann": mu_model_ann}
+    return out
+
+def _risk_scores_for_ticker(ticker: str) -> tuple[dict, float]:
+    """
+    Compute normalized risk scores r_i for each model and derive a ticker-level uncertainty s (scalar).
+    Returns (scores_per_model, s_ticker).
+    """
+    stats = _metrics_from_predictions(ticker)
+    if not stats:
+        return {}, 0.0
+
+    # collect vectors
+    rmses = np.array([v["rmse"] for v in stats.values()], dtype=float)
+    mapes = np.array([v["mape"] for v in stats.values()], dtype=float)
+    mes   = np.array([abs(v["me"]) for v in stats.values()], dtype=float)
+
+    # avoid zero denominators
+    def nzsum(x): 
+        s = np.sum(x)
+        return s if s > 0 else 1.0
+
+    s_rmse = nzsum(rmses)
+    s_mape = nzsum(mapes)
+    s_me   = nzsum(mes)
+
+    models = list(stats.keys())
+    r = {}
+    for i, m in enumerate(models):
+        r_i = (ALPHA_RMSE * (rmses[i] / s_rmse)
+             + ALPHA_MAPE * (mapes[i] / s_mape)
+             + ALPHA_ME   * (mes[i]   / s_me))
+        r[m] = float(r_i)
+
+    # ticker-level uncertainty: weighted average of model risks (weight by each model’s share in the blend below)
+    # first compute inverse-risk weights (not yet normalized); if all zeros -> equal
+    inv = np.array([1.0 / max(1e-12, r[m]) for m in models], dtype=float)
+    if not np.isfinite(inv).any() or inv.sum() == 0:
+        w_model = np.ones_like(inv) / len(inv)
+    else:
+        w_model = inv / inv.sum()
+
+    s_ticker = float(np.dot(w_model, np.array([r[m] for m in models], dtype=float)))
+    return r, s_ticker
+
+def _blended_mu_from_models(ticker: str, mu_hist_ann: float) -> float:
+    """
+    Blend historical drift with model-inferred annual drift using inverse-risk model weights.
+    """
+    stats = _metrics_from_predictions(ticker)
+    if not stats:
+        return mu_hist_ann
+
+    models = list(stats.keys())
+    risks = []
+    mus   = []
+    for m in models:
+        risks.append(max(1e-12, _risk_scores_for_ticker(ticker)[0].get(m, 1.0)))
+        mus.append(stats[m]["mu_model_ann"])
+
+    risks = np.array(risks, dtype=float)
+    mus   = np.array(mus, dtype=float)
+
+    inv = 1.0 / risks
+    w = inv / inv.sum() if inv.sum() > 0 else np.ones_like(inv) / len(inv)
+    mu_model_ann = float(np.dot(w, mus))
+
+    mu_blend = (1.0 - GAMMA_MODEL_BLEND) * mu_hist_ann + GAMMA_MODEL_BLEND * mu_model_ann
+    return mu_blend
+
+def _solve_qcqp_with_uncertainty(mu_hist_ann: np.ndarray,
+                                 Sigma_ann: np.ndarray,
+                                 tickers: list[str]) -> np.ndarray:
+    """
+    QCQP:
+      min  0.5 w' (Σ + β diag(s^2)) w - λ (μ' w)
+      s.t. sum w = 1, 0 <= w <= W_MAX,  ||diag(s) w||_2 <= κ
+    where μ = blended hist/model drift per ticker, and s from model risk.
+    """
+    n = len(tickers)
+
+    # s (uncertainty) per ticker
+    s_vec = np.zeros(n)
+    mu_vec = np.zeros(n)
+    for i, t in enumerate(tickers):
+        _, s_i = _risk_scores_for_ticker(t)
+        s_vec[i] = max(0.0, s_i)
+        mu_vec[i] = _blended_mu_from_models(t, mu_hist_ann[i])
+
+    # inflate covariance
+    Sigma_adj = Sigma_ann + BETA_COV_INFLATE * np.diag(s_vec ** 2)
+
+    # variables & constraints
+    w = cp.Variable(n)
+    Sigma_psd = cp.psd_wrap(Sigma_adj)
+    obj = cp.Minimize(0.5 * cp.quad_form(w, Sigma_psd) - LAMBDA * (mu_vec @ w))
+    cons = [cp.sum(w) == 1, w >= 0, w <= W_MAX]
+
+    # SOC on uncertainty exposure
+    if np.any(s_vec > 0):
+        cons.append(cp.norm(cp.multiply(s_vec, w), 2) <= KAPPA_UNCERT)
+
+    prob = cp.Problem(obj, cons)
+    # Try OSQP (QP), then SCS (can handle SOC)
+    try:
+        prob.solve(solver=cp.OSQP, verbose=False)
+        if w.value is None:
+            raise RuntimeError("OSQP failed")
+    except Exception:
+        prob.solve(solver=cp.SCS, verbose=False)
+    if w.value is None:
+        raise RuntimeError("QCQP failed to converge.")
+    return np.array(w.value).reshape(-1), mu_vec, s_vec, Sigma_adj
+
+def _portfolio_stats(w: np.ndarray, mu_ann: np.ndarray, Sigma_ann: np.ndarray, rf: float):
+    mu_p = float(w @ mu_ann)
+    var_p = float(w @ Sigma_ann @ w)
+    sig_p = float(np.sqrt(max(0.0, var_p)))
+    sharpe = (mu_p - rf) / sig_p if sig_p > 0 else float("nan")
+    return mu_p, sig_p, sharpe
+
+def _allocations_plot_base64(labels: list[str], weights: np.ndarray) -> str:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(labels, weights)
+    ax.set_ylim(0, max(0.55, float(weights.max()) + 0.05))
+    ax.set_title("Optimized Portfolio Weights")
+    ax.set_ylabel("Weight")
+    ax.grid(True, axis="y", alpha=0.3)
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+# -------------- main view --------------
+
+def PortfolioOptimizer(request):
+    """
+    Build a model-aware optimized portfolio and render HTML inline (as you do in Display()).
+    Query (optional):
+      ?tickers=NVDA,MSFT,TXN,AAPL
+      ?span=30min
+      ?lookback_days=252
+      ?wmax=0.5&lambda=2.5&gamma=0.6&beta=0.25&kappa=0.18
+      ?format=json  -> return JSON instead of HTML
+    """
+    # params
+    span = request.GET.get("span", DEFAULT_SPAN)
+    lookback_days = int(request.GET.get("lookback_days", LOOKBACK_DAYS))
+    if request.GET.get("tickers"):
+        tickers = [t.strip().upper() for t in request.GET.get("tickers").split(",") if t.strip()]
+    else:
+        tickers = list(Stock.objects.values_list("ticker", flat=True).distinct())
+
+    # knobs (optional overrides)
+    global W_MAX, LAMBDA, GAMMA_MODEL_BLEND, BETA_COV_INFLATE, KAPPA_UNCERT
+    W_MAX = float(request.GET.get("wmax", W_MAX))
+    LAMBDA = float(request.GET.get("lambda", LAMBDA))
+    GAMMA_MODEL_BLEND = float(request.GET.get("gamma", GAMMA_MODEL_BLEND))
+    BETA_COV_INFLATE = float(request.GET.get("beta", BETA_COV_INFLATE))
+    KAPPA_UNCERT = float(request.GET.get("kappa", KAPPA_UNCERT))
+
+    # build historical stats
+    R = _fetch_returns(tickers, span, lookback_days)
+    mu_hist, Sigma, _ = _annualize_mu_sigma(R, span)
+
+    # solve QCQP with model-aware μ and uncertainty
+    w, mu_blend, s_vec, Sigma_adj = _solve_qcqp_with_uncertainty(mu_hist, Sigma, tickers)
+
+    # stats (Sharpe uses the adjusted covariance & blended μ since that’s the portfolio the user buys)
+    mu_p, sig_p, sharpe = _portfolio_stats(w, mu_blend, Sigma_adj, rf=RF_ANNUAL)
+
+    payload = {
+        "status": "ok",
+        "tickers": tickers,
+        "weights": {t: float(x) for t, x in zip(tickers, w)},
+        "mu_annual": float(mu_p),
+        "vol_annual": float(sig_p),
+        "sharpe": float(sharpe),
+        "rf_annual": RF_ANNUAL,
+        "uncertainty_s": {t: float(s) for t, s in zip(tickers, s_vec)},
+        "mu_hist_annual": {t: float(x) for t, x in zip(tickers, mu_hist)},
+        "mu_blended_annual": {t: float(x) for t, x in zip(tickers, mu_blend)},
+        "params": {
+            "W_MAX": W_MAX,
+            "LAMBDA": LAMBDA,
+            "GAMMA_MODEL_BLEND": GAMMA_MODEL_BLEND,
+            "BETA_COV_INFLATE": BETA_COV_INFLATE,
+            "KAPPA_UNCERT": KAPPA_UNCERT,
+            "span": span,
+            "lookback_days": lookback_days
+        }
+    }
+
+    # JSON mode
+    if request.GET.get("format") == "json":
+        return JsonResponse(payload)
+
+    # --- HTML like your MSFT example ---
+    # chart
+    encoded = _allocations_plot_base64(tickers, w)
+    # info table
+    rows_html = []
+    for t in tickers:
+        rows_html.append(
+            f"<tr><td>{t}</td>"
+            f"<td style='text-align:right;'>{payload['weights'][t]:.2%}</td>"
+            f"<td style='text-align:right;'>{payload['mu_blended_annual'][t]:.2%}</td>"
+            f"<td style='text-align:right;'>{payload['uncertainty_s'][t]:.4f}</td>"
+            "</tr>"
+        )
+    table_html = (
+        "<table style='border-collapse:collapse;width:100%;max-width:720px;'>"
+        "<thead><tr>"
+        "<th style='text-align:left;border-bottom:1px solid #ccc;padding:6px;'>Ticker</th>"
+        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>Weight</th>"
+        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>μ (annual, blended)</th>"
+        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>Model risk s</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(
+            r.replace("<td", "<td style='padding:6px;border-bottom:1px solid #eee;'")
+            for r in rows_html
+        ) + "</tbody></table>"
+    )
+
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Optimize Portfolio</title></head>"
+        "<body style='margin:0;padding:16px;font-family:sans-serif;'>"
+        "<h3>Optimized Portfolio (Model-aware QCQP)</h3>"
+        f"<p style='margin:0 0 10px 0;'>Sharpe (vs {RF_ANNUAL:.2%} rf): <b>{sharpe:.3f}</b> &nbsp; "
+        f"&middot; Expected μ (annual): <b>{mu_p:.2%}</b> &nbsp; "
+        f"&middot; Vol (annual): <b>{sig_p:.2%}</b></p>"
+        f"<img style='max-width:100%;height:auto;margin:10px 0 16px 0;' src='data:image/png;base64,{encoded}' />"
+        f"{table_html}"
+        "</body></html>"
+    )
+
+    with open('optimize_portfolio.html', 'w', encoding='utf-8') as f:
+        f.write(html)
+    return render(request, 'display.html', {'html': html})

@@ -24,4 +24,6 @@ urlpatterns = [
     path('ingest/', views.Ingest, name="Ingest"),
     path('GenerateLSTMPredictions/', views.GenerateLSTMPredictions, name="GenerateLSTMPredictions"),
     path('GenerateMontePredictions/', views.GenerateMontePredictions, name="GenerateMontePredictions"),
+    path('PortfolioOptimizer/',views.PortfolioOptimizer,name="GeneratePortOptimizer")
+
 ]
