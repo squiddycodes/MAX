@@ -2,6 +2,7 @@ import json
 import math
 import random
 import os
+import glob
 import numpy as np
 import pandas as pd
 import torch
@@ -26,7 +27,7 @@ lr = 1e-3
 hidden = 64
 layers = 2
 dropout = 0.2
-save_csv_alongside_json = True   # also save CSVs next to JSONs
+model_name = "LSTM"               # << include model in metadata
 
 TICKER_FILES = {
     "NVDA": "nvda_30min.json",
@@ -77,22 +78,25 @@ def make_sequences(arr, lookback, horizon):
     for i in range(lookback, len(arr) - horizon + 1):
         X.append(arr[i - lookback : i, 0])
         y.append(arr[i : i + horizon, 0])
-    X = np.array(X)[:, :, None]          # (N, lookback, 1)
-    y = np.array(y)                       # (N, horizon)
+    X = np.array(X)[:, :, None]         # (N, lookback, 1)
+    y = np.array(y)                      # (N, horizon)
     return X, y
 
 def save_prediction_db(ticker, test_times, x_pred, y_true_test, pred_recursive,
-                       mae, rmse, mape, granularity="30min"):
+                       mae, rmse, mape, me, granularity="30min"):
     """Write per-ticker prediction database to JSON (and optional CSV)."""
     records = []
-    for i, (ts, xi, pred, act) in enumerate(zip(test_times, x_pred,
-                                                pred_recursive.reshape(-1),
-                                                y_true_test.reshape(-1))):
+    for i, (ts, xi, pred, act) in enumerate(zip(
+        test_times,
+        x_pred,
+        pred_recursive.reshape(-1),
+        y_true_test.reshape(-1)
+    )):
         records.append({
             "ticker": ticker,
             "index_in_test": i,
             "x_index": int(xi),
-            "iso_time": ts.isoformat(),          # NY-local ISO8601 with offset
+            "iso_time:ny": ts.isoformat(),   # NY-local ISO8601 with offset
             "pred_close": float(pred),
             "actual_close": float(act),
         })
@@ -100,11 +104,17 @@ def save_prediction_db(ticker, test_times, x_pred, y_true_test, pred_recursive,
     db = {
         "meta": {
             "ticker": ticker,
+            "model": model_name,             # << include model tag
             "granularity": granularity,
             "lookback": lookback,
             "horizon": horizon,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "metrics": {"MAE": float(mae), "RMSE": float(rmse), "MAPE_pct": float(mape)}
+            "metrics": {
+                "MAE": float(mae),
+                "RMSE": float(rmse),
+                "MAPE_pct": float(mape),
+                "ME": float(me)              # << include mean error (bias)
+            }
         },
         "predictions": records
     }
@@ -112,17 +122,7 @@ def save_prediction_db(ticker, test_times, x_pred, y_true_test, pred_recursive,
     json_path = f"pred_{ticker}_{granularity}.json"
     with open(json_path, "w") as f:
         json.dump(db, f, indent=2)
-
-    csv_path = None
-    if save_csv_alongside_json:
-        csv_path = f"pred_{ticker}_{granularity}.csv"
-        pd.DataFrame(records).to_csv(csv_path, index=False)
-
-    print(f"[{ticker}] Saved prediction DB -> {json_path} ({len(records)} rows)")
-    if csv_path:
-        print(f"[{ticker}] Saved CSV -> {csv_path}")
-
-    return json_path, csv_path
+    return json_path
 
 def train_one_ticker(times_ny, close_prices, ticker):
     # Sort by time
@@ -237,7 +237,8 @@ def train_one_ticker(times_ny, close_prices, ticker):
     mae  = mean_absolute_error(y_true_test, pred_recursive)
     rmse = np.sqrt(mean_squared_error(y_true_test, pred_recursive))
     mape = np.mean(np.abs((y_true_test - pred_recursive) / y_true_test)) * 100.0
-    print(f"[{ticker}] Recursive {horizon}-Step Test: MAE={mae:.4f} | RMSE={rmse:.4f} | MAPE={mape:.2f}%")
+    me   = float(np.mean(pred_recursive - y_true_test))  # << mean error (bias): pred - actual
+    print(f"[{ticker}] Recursive {horizon}-Step Test: MAE={mae:.4f} | RMSE={rmse:.4f} | MAPE={mape:.2f}% | ME={me:.4f}")
 
     # Build x-axis for predictions on test region only
     x_pos = x_positions
@@ -247,13 +248,13 @@ def train_one_ticker(times_ny, close_prices, ticker):
 
     # SAVE prediction database (JSON + optional CSV)
     test_times = list(sorted_times[x_test_start:x_test_end])
-    json_path, csv_path = save_prediction_db(
+    json_path = save_prediction_db(
         ticker=ticker,
         test_times=test_times,
         x_pred=x_pred,
         y_true_test=y_true_test,
         pred_recursive=pred_recursive,
-        mae=mae, rmse=rmse, mape=mape,
+        mae=mae, rmse=rmse, mape=mape, me=me,
         granularity="30min"
     )
 
@@ -266,10 +267,40 @@ def train_one_ticker(times_ny, close_prices, ticker):
         "actual_full": values.reshape(-1),
         "x_pred": x_pred,
         "pred_recursive": pred_recursive.reshape(-1),
-        "metrics": (mae, rmse, mape),
+        "metrics": (mae, rmse, mape, me),
         "pred_json_path": json_path,
-        "pred_csv_path": csv_path,
     }
+
+# ----------------------------
+# (Optional) Post-process existing pred_*.json artifacts in CWD
+# Adds model name and ME if missing; removes CSVs if desired
+# ----------------------------
+def update_existing_prediction_artifacts():
+    json_files = glob.glob("pred_*_30min.json")
+    for jp in json_files:
+        try:
+            with open(jp, "r") as f:
+                db = json.load(f)
+
+            meta = db.setdefault("meta", {})
+            metrics = meta.setdefault("metrics", {})
+
+            # add/overwrite model tag
+            meta["model"] = model_name
+
+            # compute ME if missing and predictions/actuals exist
+            if "ME" not in metrics and "predictions" in db and len(db["predictions"]) > 0:
+                preds = np.array([row["pred_close"] for row in db["predictions"]], dtype=float)
+                acts  = np.array([row["actual_close"] for row in db["predictions"]], dtype=float)
+                metrics["ME"] = float(np.mean(preds - acts))
+
+            with open(jp, "w") as f:
+                json.dump(db, f, indent=2)
+            print(f"[update] Patched {jp} with model='{model_name}' and ME={metrics.get('ME', 'NA')}")
+
+        except Exception as e:
+            print(f"[update] Skipped {jp}: {e}")
+
 
 # ----------------------------
 # Load all files, train per ticker, collect results
@@ -284,6 +315,9 @@ for ticker, fname in TICKER_FILES.items():
     res = train_one_ticker(times_ny, close_prices, ticker)
     all_results.append(res)
 
+# Post-patch any existing pred_*.json files (useful if rerunning in a directory with prior outputs)
+update_existing_prediction_artifacts()
+
 # ----------------------------
 # Write a small index of saved databases (handy for downstream jobs)
 # ----------------------------
@@ -292,15 +326,20 @@ pred_index = {
     "granularity": "30min",
     "lookback": lookback,
     "horizon": horizon,
+    "model": model_name,  # include model at index level, too
     "tickers": []
 }
 for r in all_results:
-    m_mae, m_rmse, m_mape = r["metrics"]
+    m_mae, m_rmse, m_mape, m_me = r["metrics"]
     pred_index["tickers"].append({
         "ticker": r["ticker"],
         "pred_json_path": r["pred_json_path"],
-        "pred_csv_path": r["pred_csv_path"],
-        "metrics": {"MAE": float(m_mae), "RMSE": float(m_rmse), "MAPE_pct": float(m_mape)}
+        "metrics": {
+            "MAE": float(m_mae),
+            "RMSE": float(m_rmse),
+            "MAPE_pct": float(m_mape),
+            "ME": float(m_me)
+        }
     })
 
 with open("pred_index.json", "w") as f:
