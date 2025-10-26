@@ -1,0 +1,52 @@
+<style>
+  .button-link {
+    color: inherit;
+    text-decoration: none;
+  }
+  nav {
+    background-color: #333;
+    padding: 10px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    z-index: 1000;
+  }
+  nav ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    gap: 20px;
+  }
+  nav a {
+    color: white;
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  nav a:hover {
+    color: #ffcc00; /* golden hover */
+  }
+  body {
+    margin: 0;
+    padding-top: 75px;
+  }
+</style>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+<body>
+<nav>
+  <ul>
+    <li><a href="{% url 'Home' %}">Home</a></li>
+    <li><a href="{% url 'GeneratePortOptimizer' %}">Portfolio</a></li>
+    <li><a href="{% url 'Display' %}">Show Stock Predictions</a></li>
+  </ul>
+  <h2 style="color: white; margin: 0;">Stock Prediction Assistant</h2>
+</nav>
+
+{% block content %}
+
+{%endblock%}
+</body>

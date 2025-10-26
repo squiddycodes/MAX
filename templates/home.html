@@ -1,18 +1,16 @@
-<style>
-  .button-link {
-    color: inherit;
-    text-decoration: none;
-  }
-</style>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+{% extends "base.html" %}
 
-<body style="text-align:center">
-    <h1>Finance Prediction Assistant</h1>
-
-    <button class="btn btn-secondary"><a href="{% url 'Ingest' %}" class="button-link">Ingest Cases from JSON</a></button><br><br>
-    <button class="btn btn-secondary"><a href="{% url 'GenerateLSTMPredictions' %}" class="button-link">Generate LSTM Predictions</a></button><br><br>
-    <button class="btn btn-secondary"><a href="{% url 'GenerateMontePredictions' %}" class="button-link">Generate Monte Predictions</a></button><br><br>
-    <button class="btn btn-success"><a href="{% url 'GeneratePortOptimizer' %}" class="button-link">Generate Portfolio</a></button><br><br>
-
-    <button class="btn btn-primary"><a href="{% url 'Display' %}"  class="button-link">Display</a></button>
+{% block content %}
+<body style="text-align:center;">
+    <br>
+    <h1>Home</h1>
+    <h2>Ingest Stocks & Cases:</h2>
+    <button class="btn btn-primary"><a href="{% url 'Ingest' %}" class="button-link">Ingest Cases from JSON</a></button><br><br>
+    <br><h2>Generate Predictions:</h2>
+    <button class="btn btn-primary"><a href="{% url 'GenerateLSTMPredictions' %}" class="button-link">Generate LSTM Predictions</a></button><br><br>
+    <button class="btn btn-primary"><a href="{% url 'GenerateMontePredictions' %}" class="button-link">Generate Monte Predictions</a></button><br><br>
+    <br><h2>Stock Suite:</h2>
+    <button class="btn btn-primary"><a href="{% url 'GeneratePortOptimizer' %}" class="button-link">Portfolio</a></button><br><br>
+    <button class="btn btn-primary"><a href="{% url 'Display' %}" class="button-link">Show Stock Predictions</a></button><br><br>
 </body>
+{% endblock %}
