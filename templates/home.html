@@ -1,8 +1,18 @@
-<h1>MAX</h1>
+<style>
+  .button-link {
+    color: inherit;
+    text-decoration: none;
+  }
+</style>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
 
-<button><a href="{% url 'Ingest' %}">Ingest Cases from JSON</a></button>
-<button><a href="{% url 'GenerateLSTMPredictions' %}">Generate LSTM Predictions</a></button>
-<button><a href="{% url 'GenerateMontePredictions' %}">Generate Monte Predictions</a></button>
-<button><a href="{% url 'GeneratePortOptimizer' %}">Generate Portfolio</a></button>
+<body style="text-align:center">
+    <h1>Finance Prediction Assistant</h1>
 
-<button><a href="{% url 'Display' %}">Display</a></button>
+    <button class="btn btn-secondary"><a href="{% url 'Ingest' %}" class="button-link">Ingest Cases from JSON</a></button><br><br>
+    <button class="btn btn-secondary"><a href="{% url 'GenerateLSTMPredictions' %}" class="button-link">Generate LSTM Predictions</a></button><br><br>
+    <button class="btn btn-secondary"><a href="{% url 'GenerateMontePredictions' %}" class="button-link">Generate Monte Predictions</a></button><br><br>
+    <button class="btn btn-success"><a href="{% url 'GeneratePortOptimizer' %}" class="button-link">Generate Portfolio</a></button><br><br>
+
+    <button class="btn btn-primary"><a href="{% url 'Display' %}"  class="button-link">Display</a></button>
+</body>
