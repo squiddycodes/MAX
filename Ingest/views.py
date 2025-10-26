@@ -4,6 +4,8 @@ from pathlib import Path
 import random
 from . import models
 import json
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for server environments
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import base64
@@ -18,13 +20,39 @@ def Display(request):
         data = json.load(f)
 
     # --- Extract time and closing prices ---
-    times = [datetime.fromisoformat(entry['iso_ny']) for entry in data]
-    close_prices = [entry['c'] for entry in data]
+    #times = [datetime.fromisoformat(entry['iso_ny']) for entry in data] #GET ARRAY OF ISO_NY - X
+    times = []
+    timesNVDA = []
+    timesTXN = []
+    timesMSFT = []
+    close_prices = []
+    close_pricesNVDA = []
+    close_pricesTXN = []
+    close_pricesMSFT = []
+    for case in models.Case.objects.all():
+        if case.ticker == "AAPL":
+            times.append(case.iso_ny)
+            close_prices.append(case.c)
+        elif case.ticker == "NVDA":
+            timesNVDA.append(case.iso_ny)
+            close_pricesNVDA.append(case.c)
+        elif case.ticker == "TXN":
+            timesTXN.append(case.iso_ny)
+            close_pricesTXN.append(case.c)
+        elif case.ticker == "MSFT":
+            timesMSFT.append(case.iso_ny)
+            close_pricesMSFT.append(case.c)
 
     # --- Detect gaps and create continuous x-axis ---
     gap_threshold = timedelta(minutes=35)  # Slightly more than 30 min to detect gaps
     x_positions = [0]  # Start at position 0
+    xPosNVDA = [0]
+    xPosTXN = [0]
+    xPosMSFT = [0]
     gap_locations = []  # Store where gaps occur (start index of new sessions)
+    gapLocationsNVDA = []
+    gapLocationsTXN = []
+    gapLocationsMSFT = []
 
     for i in range(1, len(times)):
         time_diff = times[i] - times[i - 1]
@@ -36,14 +64,48 @@ def Display(request):
             # Normal progression
             x_positions.append(x_positions[-1] + 1)
 
+    for i in range(1, len(timesNVDA)):
+        time_diff = timesNVDA[i] - timesNVDA[i - 1]
+        if time_diff > gap_threshold:
+            # Gap detected - record position where the new session starts
+            xPosNVDA.append(xPosNVDA[-1] + 1)
+            gapLocationsNVDA.append(xPosNVDA[-1])  # mark session boundary
+        else:
+            # Normal progression
+            xPosNVDA.append(xPosNVDA[-1] + 1)
+
+    for i in range(1, len(timesTXN)):
+            time_diff = timesTXN[i] - timesTXN[i - 1]
+            if time_diff > gap_threshold:
+                # Gap detected - record position where the new session starts
+                xPosTXN.append(xPosTXN[-1] + 1)
+                gapLocationsTXN.append(xPosTXN[-1])  # mark session boundary
+            else:
+                # Normal progression
+                xPosTXN.append(xPosTXN[-1] + 1)
+
+    for i in range(1, len(timesMSFT)):
+        time_diff = timesMSFT[i] - timesMSFT[i - 1]
+        if time_diff > gap_threshold:
+            # Gap detected - record position where the new session starts
+            xPosMSFT.append(xPosMSFT[-1] + 1)
+            gapLocationsMSFT.append(xPosMSFT[-1])  # mark session boundary
+        else:
+            # Normal progression
+            xPosMSFT.append(xPosMSFT[-1] + 1)
+
+
     # --- Create the plot ---
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(x_positions, close_prices, label='MSFT Closing Price', linewidth=2)
+    ax.plot(xPosNVDA, close_pricesNVDA, label='NVDA Closing Price', linewidth=2)
+    ax.plot(xPosTXN, close_pricesTXN, label='TXN Closing Price', linewidth=2)
+    ax.plot(xPosMSFT, close_pricesMSFT, label='MSFT Closing Price', linewidth=2)
 
     # --- NO vertical lines (removed) ---
 
     # --- Format axes ---
-    ax.set_title("MSFT Stock Closing Prices Over Time (Gaps Removed)", fontsize=14)
+    ax.set_title("MSFT, NVDA, TXN and AAPL Stock Closing Prices Over Time (Gaps Removed)", fontsize=14)
     ax.set_xlabel("Trading Period Index", fontsize=12)
     ax.set_ylabel("Price (USD)", fontsize=12)
     ax.grid(True, alpha=0.3)
