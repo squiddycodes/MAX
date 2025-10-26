@@ -1257,7 +1257,7 @@ def PortfolioOptimizer(request):
             "</tr>"
         )
     table_html = (
-        "<table style='border-collapse:collapse;width:100%;max-width:720px;'>"
+        "<table style='border-collapse:collapse;width:100%;max-width:720px;' class='centerTable'>"
         "<thead><tr>"
         "<th style='text-align:left;border-bottom:1px solid #ccc;padding:6px;'>Ticker</th>"
         "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>Weight</th>"
