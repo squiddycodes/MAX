@@ -1,8 +1,6 @@
 from django.shortcuts import render, redirect
 import json
 from pathlib import Path
-import random
-from . import models
 import json
 import matplotlib
 matplotlib.use('Agg')  # Use non-GUI backend for server environments
@@ -11,7 +9,136 @@ from datetime import datetime, timedelta
 import base64
 from io import BytesIO
 
-# Create your views here.
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+from django.db import transaction
+
+import math
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from datetime import datetime, timedelta
+from django.http import JsonResponse
+from Ingest.models import Case, Prediction, PredictionMeta, Stock
+
+
+MODEL_NAME_MONTE = "MonteCarloGBM"
+N_SIMS = 1000
+
+def run_monte_carlo_simulation(historical_prices, n_sims=N_SIMS):
+    """Run Monte Carlo GBM simulation."""
+    split_index = int(len(historical_prices) * 0.80)
+    train_data = historical_prices.iloc[:split_index]
+    test_data = historical_prices.iloc[split_index:]
+
+    if len(train_data) < 2:
+        print("Not enough training data. Skipping.")
+        return None, None, None
+
+    log_returns = np.log(train_data / train_data.shift(1)).dropna()
+    mu = log_returns.mean()
+    sigma = log_returns.std()
+
+    S0 = train_data.iloc[-1]
+    T = len(test_data)
+    dt = 1
+
+    all_walks = np.zeros((T + 1, n_sims))
+    all_walks[0, :] = S0
+
+    for i in range(n_sims):
+        for t in range(1, T + 1):
+            Z = np.random.standard_normal()
+            all_walks[t, i] = all_walks[t - 1, i] * np.exp(
+                (mu - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * Z
+            )
+
+    avg_walk_values = np.mean(all_walks, axis=1)
+    combined_index = train_data.index[[-1]].union(test_data.index)
+    avg_walk_series = pd.Series(avg_walk_values, index=combined_index)
+
+    return train_data, test_data, avg_walk_series
+
+
+@transaction.atomic
+def generate_monte_predictions():
+    """Generate Monte Carlo predictions for all tickers in DB."""
+    tickers = Stock.objects.values_list("ticker", flat=True)
+    print(f"Found {len(tickers)} tickers to process: {list(tickers)}")
+
+    for ticker in tickers:
+        print(f"\n--- Processing {ticker} ---")
+
+        # Fetch historical cases for this ticker
+        cases = Case.objects.filter(ticker=ticker).order_by("iso_ny")
+        if not cases.exists():
+            print(f"No Case data for {ticker}. Skipping.")
+            continue
+
+        times = [c.iso_ny for c in cases]
+        prices = [c.c for c in cases]
+
+        df = pd.DataFrame({"iso_ny": times, "c": prices}).set_index("iso_ny")
+
+        train, test, avg_walk = run_monte_carlo_simulation(df["c"])
+        if train is None:
+            continue
+
+        test_values = test.values
+        predicted_values = avg_walk.iloc[1:].values  # skip initial S0
+
+        errors = predicted_values - test_values
+        me = float(np.mean(errors))
+        mae = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(np.mean(errors ** 2)))
+        safe_test_values = np.where(test_values == 0, 1e-9, test_values)
+        mape = float(np.mean(np.abs(errors / safe_test_values)) * 100)
+
+        print(f"  Metrics for {ticker}: ME={me:.4f}, MAE={mae:.4f}, RMSE={rmse:.4f}, MAPE={mape:.2f}%")
+
+        # Save Prediction rows
+        split_index = len(train)
+        test_cases = cases[split_index:]
+
+        predictions_to_create = []
+        for i, (actual, pred, case_obj) in enumerate(zip(test_values, predicted_values, test_cases)):
+            predictions_to_create.append(
+                Prediction(
+                    ticker=ticker,
+                    x_index=i,
+                    iso_time=case_obj.iso_ny,
+                    pred_close=float(pred),
+                    actual_close=float(actual),
+                    model=MODEL_NAME_MONTE
+                )
+            )
+        print("PREDS[0]",MODEL_NAME)
+        Prediction.objects.bulk_create(predictions_to_create, batch_size=500)
+        print(f"  Saved {len(predictions_to_create)} predictions for {ticker}")
+
+        # Save PredictionMeta row
+        PredictionMeta.objects.update_or_create(
+            ticker=ticker,
+            model=MODEL_NAME_MONTE,
+            mape=mape
+        )
+        print(f"  Saved PredictionMeta for {ticker}")
+
+    print("\n✅ Monte Carlo predictions complete for all tickers.")
+
+
+
+def GenerateMontePredictions(request):
+    generate_monte_predictions()
+    return redirect("/")
+
+
 def Home(request):
     return render(request, 'home.html')
 
@@ -29,7 +156,7 @@ def Display(request):
     close_pricesNVDA = []
     close_pricesTXN = []
     close_pricesMSFT = []
-    for case in models.Case.objects.all():
+    for case in Case.objects.all():
         if case.ticker == "AAPL":
             times.append(case.iso_ny)
             close_prices.append(case.c)
@@ -156,12 +283,12 @@ def fetchCases(request):
     return
 
 def Ingest(request):
-    if models.Stock.objects.exists() or models.Case.objects.exists():
+    if Stock.objects.exists() or Case.objects.exists():
         return redirect('/')
 
     #CREATE STOCKS
     for stock in ["AAPL", "MSFT", "TXN", "NVDA"]:
-        models.Stock(ticker=stock).save()
+        Stock(ticker=stock).save()
 
     #get the absolute path of the json files
     base_dir = Path(__file__).resolve().parent 
@@ -172,8 +299,8 @@ def Ingest(request):
         with file.open('r') as f:
             data = json.load(f)#load json
             for obj in data:
-                stockTicker = models.Stock.objects.filter(ticker=obj["ticker"])
-                case = models.Case(
+                stockTicker = Stock.objects.filter(ticker=obj["ticker"])
+                case = Case(
                     ticker=obj["ticker"],
                     t=obj["t"],
                     iso_utc=obj["iso_utc"],
@@ -193,21 +320,6 @@ def Ingest(request):
         print("Done with",file)
     return redirect('/')
         
-#def GenerateLSTMPredictions(request):
-#    return redirect('/')
-
-import math
-import random
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from datetime import datetime, timedelta
-from django.http import JsonResponse
-from Ingest.models import Case, Prediction, PredictionMeta
 
 # ----------------------------
 # Configuration
