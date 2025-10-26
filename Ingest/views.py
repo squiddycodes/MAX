@@ -100,6 +100,8 @@ def run_monte_carlo_simulation(historical_prices, n_sims=N_SIMS):
 
 @transaction.atomic
 def generate_monte_predictions():
+    if Prediction.objects.filter(model='MonteCarloGBM').exists() or PredictionMeta.objects.filter(model='MonteCarloGBM').exists():
+        return redirect("/")
     """Generate Monte Carlo predictions for all tickers in DB."""
     tickers = Stock.objects.values_list("ticker", flat=True)
     print(f"Found {len(tickers)} tickers to process: {list(tickers)}")
@@ -580,7 +582,7 @@ def train_one_ticker(ticker):
 # ----------------------------
 def GenerateLSTMPredictions(request):
     """Train LSTM models for all tickers in Case table."""
-    if Prediction.objects.exists() or PredictionMeta.objects.exists():
+    if Prediction.objects.filter(model='LSTM_30min').exists() or PredictionMeta.objects.filter(model='LSTM_30min').exists():
         return redirect("/")
     tickers = Case.objects.values_list("ticker", flat=True).distinct()
     results = []
