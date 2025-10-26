@@ -1259,10 +1259,10 @@ def PortfolioOptimizer(request):
     table_html = (
         "<table style='border-collapse:collapse;width:100%;max-width:720px;' class='centerTable'>"
         "<thead><tr>"
-        "<th style='text-align:left;border-bottom:1px solid #ccc;padding:6px;'>Ticker</th>"
-        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>Weight</th>"
-        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>μ (annual, blended)</th>"
-        "<th style='text-align:right;border-bottom:1px solid #ccc;padding:6px;'>Model risk s</th>"
+        "<th>Ticker</th>"
+        "<th>Weight</th>"
+        "<th>μ (annual, blended)</th>"
+        "<th>Model risk s</th>"
         "</tr></thead>"
         "<tbody>" + "".join(
             r.replace("<td", "<td style='padding:6px;border-bottom:1px solid #eee;'")
