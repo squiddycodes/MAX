@@ -176,142 +176,169 @@ def GenerateMontePredictions(request):
 def Home(request):
     return render(request, 'home.html')
 
+
+
 def Display(request):
-    with open('msft_30min.json', 'r') as f:
-        data = json.load(f)
+    # ---- Config
+    tickers = ["AAPL", "NVDA", "TXN", "MSFT"]
+    gap_threshold = timedelta(minutes=35)
 
-    # --- Extract time and closing prices ---
-    #times = [datetime.fromisoformat(entry['iso_ny']) for entry in data] #GET ARRAY OF ISO_NY - X
-    times = []
-    timesNVDA = []
-    timesTXN = []
-    timesMSFT = []
-    close_prices = []
-    close_pricesNVDA = []
-    close_pricesTXN = []
-    close_pricesMSFT = []
-    for case in Case.objects.all():
-        if case.ticker == "AAPL":
-            times.append(case.iso_ny)
-            close_prices.append(case.c)
-        elif case.ticker == "NVDA":
-            timesNVDA.append(case.iso_ny)
-            close_pricesNVDA.append(case.c)
-        elif case.ticker == "TXN":
-            timesTXN.append(case.iso_ny)
-            close_pricesTXN.append(case.c)
-        elif case.ticker == "MSFT":
-            timesMSFT.append(case.iso_ny)
-            close_pricesMSFT.append(case.c)
+    # Fixed palette so actual + preds share the same color per ticker
+    ticker_colors = {
+        "AAPL": "tab:blue",
+        "MSFT": "tab:orange",
+        "TXN":  "tab:green",
+        "NVDA": "tab:red",
+    }
 
-    # --- Detect gaps and create continuous x-axis ---
-    gap_threshold = timedelta(minutes=35)  # Slightly more than 30 min to detect gaps
-    x_positions = [0]  # Start at position 0
-    xPosNVDA = [0]
-    xPosTXN = [0]
-    xPosMSFT = [0]
-    gap_locations = []  # Store where gaps occur (start index of new sessions)
-    gapLocationsNVDA = []
-    gapLocationsTXN = []
-    gapLocationsMSFT = []
+    # Containers
+    series = {}            # ticker -> dict(times, closes, x, gaps)
+    time_to_x = {}         # ticker -> {datetime -> x_index}
 
-    for i in range(1, len(times)):
-        time_diff = times[i] - times[i - 1]
-        if time_diff > gap_threshold:
-            # Gap detected - record position where the new session starts
-            x_positions.append(x_positions[-1] + 1)
-            gap_locations.append(x_positions[-1])  # mark session boundary
-        else:
-            # Normal progression
-            x_positions.append(x_positions[-1] + 1)
+    # ---- Load actuals and build continuous x-axes per ticker
+    for t in tickers:
+        rows = list(
+            Case.objects.filter(ticker=t).order_by("iso_ny").values("iso_ny", "c")
+        )
+        if not rows:
+            continue
 
-    for i in range(1, len(timesNVDA)):
-        time_diff = timesNVDA[i] - timesNVDA[i - 1]
-        if time_diff > gap_threshold:
-            # Gap detected - record position where the new session starts
-            xPosNVDA.append(xPosNVDA[-1] + 1)
-            gapLocationsNVDA.append(xPosNVDA[-1])  # mark session boundary
-        else:
-            # Normal progression
-            xPosNVDA.append(xPosNVDA[-1] + 1)
+        times = [r["iso_ny"] for r in rows]
+        prices = [float(r["c"]) for r in rows]
 
-    for i in range(1, len(timesTXN)):
-            time_diff = timesTXN[i] - timesTXN[i - 1]
-            if time_diff > gap_threshold:
-                # Gap detected - record position where the new session starts
-                xPosTXN.append(xPosTXN[-1] + 1)
-                gapLocationsTXN.append(xPosTXN[-1])  # mark session boundary
+        x = [0]
+        gaps = []
+        for i in range(1, len(times)):
+            if times[i] - times[i-1] > gap_threshold:
+                x.append(x[-1] + 1)
+                gaps.append(x[-1])
             else:
-                # Normal progression
-                xPosTXN.append(xPosTXN[-1] + 1)
+                x.append(x[-1] + 1)
 
-    for i in range(1, len(timesMSFT)):
-        time_diff = timesMSFT[i] - timesMSFT[i - 1]
-        if time_diff > gap_threshold:
-            # Gap detected - record position where the new session starts
-            xPosMSFT.append(xPosMSFT[-1] + 1)
-            gapLocationsMSFT.append(xPosMSFT[-1])  # mark session boundary
-        else:
-            # Normal progression
-            xPosMSFT.append(xPosMSFT[-1] + 1)
+        # map timestamps → x for aligning predictions
+        t2x = {ts: xi for ts, xi in zip(times, x)}
 
+        series[t] = {
+            "times": times,
+            "prices": prices,
+            "x": x,
+            "gaps": gaps
+        }
+        time_to_x[t] = t2x
 
-    # --- Create the plot ---
+    # Choose a reference ticker (longest history) for xticks
+    if not series:
+        return render(request, "display.html", {"html": "<p>No data found.</p>"})
+    ref = max(series.keys(), key=lambda k: len(series[k]["x"]))
+
+    # ---- Pull predictions and align to x for each ticker
+    preds = {t: {"MC": ([], []), "LSTM": ([], [])} for t in series.keys()}
+    for t in series.keys():
+        t2x = time_to_x[t]
+
+        # MonteCarloGBM
+        rows_mc = list(
+            Prediction.objects.filter(ticker=t, model="MonteCarloGBM")
+            .order_by("iso_time")
+            .values("iso_time", "pred_close")
+        )
+        x_mc, y_mc = [], []
+        for r in rows_mc:
+            ts = r["iso_time"]
+            if ts in t2x:
+                x_mc.append(t2x[ts])
+                y_mc.append(float(r["pred_close"]))
+        preds[t]["MC"] = (x_mc, y_mc)
+
+        # LSTM_30min
+        rows_lstm = list(
+            Prediction.objects.filter(ticker=t, model="LSTM_30min")
+            .order_by("iso_time")
+            .values("iso_time", "pred_close")
+        )
+        x_l, y_l = [], []
+        for r in rows_lstm:
+            ts = r["iso_time"]
+            if ts in t2x:
+                x_l.append(t2x[ts])
+                y_l.append(float(r["pred_close"]))
+        preds[t]["LSTM"] = (x_l, y_l)
+
+    # ---- Plot
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(x_positions, close_prices, label='MSFT Closing Price', linewidth=2)
-    ax.plot(xPosNVDA, close_pricesNVDA, label='NVDA Closing Price', linewidth=2)
-    ax.plot(xPosTXN, close_pricesTXN, label='TXN Closing Price', linewidth=2)
-    ax.plot(xPosMSFT, close_pricesMSFT, label='MSFT Closing Price', linewidth=2)
 
-    # --- NO vertical lines (removed) ---
+    for t in series.keys():
+        col = ticker_colors.get(t, None)
+        # Actual (solid)
+        ax.plot(series[t]["x"], series[t]["prices"],
+                label=f"{t} Actual", linewidth=2, color=col)
 
-    # --- Format axes ---
-    ax.set_title("MSFT, NVDA, TXN and AAPL Stock Closing Prices Over Time (Gaps Removed)", fontsize=14)
-    ax.set_xlabel("Trading Period Index", fontsize=12)
-    ax.set_ylabel("Price (USD)", fontsize=12)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+        # Monte Carlo predictions (dotted)
+        x_mc, y_mc = preds[t]["MC"]
+        if x_mc:
+            ax.plot(x_mc, y_mc, linestyle=":", linewidth=2,
+                    label=f"{t} MC Pred", color=col)
 
-    # --- Custom x-axis labels: use session start dates, but drop the first date ---
-    # Choose ~10 evenly spaced session boundaries for labeling
-    if gap_locations:
-        stride = max(1, len(gap_locations) // 10)
-        # positions to label (session starts), EXCLUDING the first overall start
-        tick_positions = gap_locations[::stride]
-        # Build matching labels
+        # LSTM predictions (dashed)
+        x_l, y_l = preds[t]["LSTM"]
+        if x_l:
+            ax.plot(x_l, y_l, linestyle="--", linewidth=2,
+                    label=f"{t} LSTM Pred", color=col)
+
+    # ---- X tick labels from reference ticker’s dates (session starts)
+    gaps_ref = series[ref]["gaps"]
+    if gaps_ref:
+        stride = max(1, len(gaps_ref) // 10)
+        tick_positions = gaps_ref[::stride]
         tick_labels = []
+        times_ref = series[ref]["times"]
+        x_ref = series[ref]["x"]
         for pos in tick_positions:
-            # map x-position back to corresponding time index
-            idx = x_positions.index(pos)
-            if idx < len(times):
-                tick_labels.append(times[idx].strftime('%m/%d'))
-        # Apply ticks/labels (only if we have any)
+            try:
+                idx = x_ref.index(pos)
+                tick_labels.append(times_ref[idx].strftime("%m/%d"))
+            except ValueError:
+                pass
         if tick_positions and tick_labels:
             ax.set_xticks(tick_positions[:len(tick_labels)])
-            ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+            ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+
+    ax.set_title("AAPL, NVDA, TXN, MSFT — Actual vs. Monte Carlo (dotted) & LSTM (dashed)")
+    ax.set_xlabel("Trading Period Index")
+    ax.set_ylabel("Price (USD)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.1),  # below the x-axis
+        ncol=3,
+        frameon=False
+    )
+    # Reposition axis labels closer to origin
+    ax.xaxis.set_label_coords(0.1, -0.17)   # (x=0.5 means centered horizontally)
+    ax.yaxis.set_label_coords(-0.05, 0.2)   # (y=0.5 means centered vertically)
+
 
     plt.tight_layout()
 
-    # --- Save figure as embedded base64 image inside an HTML file ---
-    tmpfile = BytesIO()
-    fig.savefig(tmpfile, format='png', bbox_inches='tight')
-    encoded = base64.b64encode(tmpfile.getvalue()).decode('utf-8')
+    # ---- Embed figure as base64 in HTML
+    tmp = BytesIO()
+    fig.savefig(tmp, format="png", bbox_inches="tight")
+    encoded = base64.b64encode(tmp.getvalue()).decode("utf-8")
+    plt.close(fig)
 
     html = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>MSFT Plot</title></head>"
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Stocks</title></head>"
         "<body style='margin:0;padding:16px;font-family:sans-serif;'>"
-        "<h3>MSFT Stock Closing Prices Over Time (Gaps Removed)</h3>"
+        "<h3>Actual vs. Predictions (Monte Carlo = dotted, LSTM = dashed)</h3>"
         f"<img style='max-width:100%;height:auto;' src='data:image/png;base64,{encoded}' />"
         "</body></html>"
     )
 
-    with open('stock.html', 'w', encoding='utf-8') as f:
-        f.write(html)
+    return render(request, "display.html", {"html": html})
 
-    # Optional: close the figure
-    plt.close(fig)
 
-    return render(request, 'display.html', {'html': html})
+
 
 def fetchCases(request):
     return
