@@ -24,3 +24,4 @@ class Case(models.Model):
   s = models.FloatField(null=True)
 
   stock = models.ForeignKey(Stock, on_delete=models.CASCADE, null=True)#stock assigned by ticker charfield, matches with name
+
