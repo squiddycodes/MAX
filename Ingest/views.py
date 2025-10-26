@@ -921,9 +921,9 @@ def _run_optimizer(window: int, rf_annual: float, tickers_param: str | None, spa
 
 # ----- Tunables -----
 RF_ANNUAL = 0.0386                         # risk-free (annualized)
-W_MAX     = 0.35                           # per-name cap
+W_MAX     = 0.5                           # per-name cap
 LAMBDA    = 2.5                            # return-risk tradeoff in objective
-GAMMA_MODEL_BLEND = 0.60                   # weight of model forecasts in expected return
+GAMMA_MODEL_BLEND = .99                   # weight of model forecasts in expected return
 BETA_COV_INFLATE  = 0.25                   # how much model risk inflates covariance
 KAPPA_UNCERT      = 0.18                   # SOC cap for forecast-uncertainty exposure
 LOOKBACK_DAYS     = 252                    # history anchor
