@@ -1,10 +1,7 @@
-<style>
-  .button-link {
-    color: inherit;
-    text-decoration: none;
-  }
-</style>
+{% extends "base.html" %}
 
-<h1>Portfolio Optimization</h1>
-<button><a href="{% url 'Home' %}" class="button-link">Home</a></button>
-{{ html | safe }}
+{% block content %}
+    <h1>Portfolio Optimization</h1>
+    <button><a href="{% url 'Home' %}" class="button-link">Home</a></button>
+    {{ html | safe }}
+{% endblock %}
